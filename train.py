@@ -3,6 +3,8 @@
 用法: python train.py
 """
 
+import csv
+import gc
 import math
 import os
 import glob
@@ -12,7 +14,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-import pandas as pd
 
 from model import GPT, get_device
 
@@ -111,11 +112,13 @@ with open("vocab.json", "w", encoding="utf-8") as f:
     }, f, ensure_ascii=False)
 print("字符映射已保存为 vocab.json（含超参数）")
 
-# 数据分割
+# 数据分割 — text 编码后释放原始字符串
 data = torch.tensor(encode(text), dtype=torch.int32)
 n_train = int(0.9 * len(data))
 train_data = data[:n_train]
 val_data = data[n_train:]
+del text  # 释放 5M+ 字符串内存
+gc.collect()
 
 
 def get_batch(split: str):
@@ -225,6 +228,9 @@ for iter in range(start_iter, max_iters):
     # --- 评估 ---
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
+        # CUDA: 评估完后清一波碎片
+        if device == "cuda":
+            torch.cuda.empty_cache()
         eval_time = time.time() - iter_start
         train_ppl = math.exp(losses["train"])
         val_ppl = math.exp(losses["val"])
@@ -358,14 +364,11 @@ print("\n=== 生成示例 ===")
 print(generated_text)
 
 # 保存训练数据
-loss_df = pd.DataFrame({
-    "step": eval_steps,
-    "train_loss": train_losses,
-    "val_loss": val_losses,
-    "train_perplexity": train_ppls,
-    "val_perplexity": val_ppls,
-})
-loss_df.to_csv("loss_history.csv", index=False)
+with open("loss_history.csv", "w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
+    w.writerow(["step", "train_loss", "val_loss", "train_perplexity", "val_perplexity"])
+    for row in zip(eval_steps, train_losses, val_losses, train_ppls, val_ppls):
+        w.writerow(row)
 
 with open("training_log.txt", "w", encoding="utf-8") as f:
     f.write(f"设备: {device}\n")

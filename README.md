@@ -6,10 +6,15 @@
 
 ```
 .
-├── model.py          # 公共模型定义（GPT / TransformerBlock / Attention / MLP）
-├── preprocess.py     # 语料预处理：parquet 对话文件 → 纯文本 txt
-├── train.py          # 训练脚本：数据加载 → 训练 → 评估 → 可视化 → 导出
-├── inference.py      # 推理脚本：交互式生成 / 命令行单次生成
+├── model.py             # 公共模型定义（GPT / TransformerBlock / Attention / MLP）
+├── preprocess.py        # 语料预处理：parquet 对话文件 → 纯文本 txt
+├── train.py             # 训练脚本：数据加载 → 训练 → 评估 → 可视化 → 导出
+├── inference.py         # 推理脚本：交互式生成 / 命令行单次生成
+├── export_weights.py    # 权重导出：PyTorch 模型 → C++ 推理二进制格式
+├── cpp/                 # C++ 推理引擎（零外部依赖，纯 C++17）
+│   ├── slm_model.h      #   核心：矩阵运算 + GPT forward/generate
+│   ├── inference.cpp    #   入口：命令行 + 交互模式
+│   └── README.md
 └── README.md
 ```
 
@@ -176,3 +181,30 @@ GPT (Decoder-only Transformer)
 **Q: 如何用自己的 txt 语料直接训练？**
 
 跳过 preprocess，直接把 txt 文件放入 `input/` 文件夹（与 train.py 同目录），然后运行 `python train.py`。
+
+## C++ 推理引擎
+
+纯 C++ 实现的推理，零外部依赖，单文件 exe 约 15MB，可拷贝到任意 Windows 机器运行。
+
+### 导出权重
+
+```bash
+python export_weights.py mini_gpt.pt vocab.json ./cpp
+```
+
+产物：`cpp/model_weights.bin` + `cpp/vocab.bin`
+
+### 编译与运行
+
+```bash
+cd cpp
+g++ -std=c++17 -O2 -static inference.cpp -o inference_cpp.exe
+
+# 交互模式
+./inference_cpp.exe
+
+# 单次生成
+./inference_cpp.exe "Hello" --tokens 200 --temp 0.8 --topk 40
+```
+
+详见 `cpp/README.md`

@@ -2,6 +2,7 @@
 语料预处理：parquet 对话/文本文件 → 纯文本 txt 文件
 """
 
+import gc
 import os
 import glob
 import concurrent.futures
@@ -19,49 +20,99 @@ SKIPPED_FILES = []
 ERROR_FILES = []
 
 
+# 分块写入阈值：pieces 超过此数量就先 join 写入并清空
+CHUNK_PIECES = 100_000
+# 分块写入缓冲区：join 后超过此字节数也触发写入
+CHUNK_BYTES = 4 * 1024 * 1024  # 4MB
+
+
+def _flush_pieces(pieces: list, f_out) -> None:
+    """将 pieces 列表 join 写入文件并清空"""
+    if not pieces:
+        return
+    text = "".join(pieces)
+    f_out.write(text)
+    pieces.clear()
+
+
 def process_parquet(file_path: str, output_dir: str) -> dict:
     """
     处理单个 Parquet 文件，提取文本并保存为同名 .txt 文件。
     返回 {"ok": True/False, "path": ..., "error": ...}
     """
-    text = ""
     try:
-        table = pq.read_table(file_path)
+        table = pq.read_table(file_path, memory_map=True)
         columns = table.column_names
 
-        if "conversations" in columns:
-            df = table.select(["conversations"]).to_pandas()
-            for conversations in df["conversations"]:
-                if isinstance(conversations, list):
-                    for turn in conversations:
-                        if isinstance(turn, dict) and "content" in turn:
-                            role = turn.get("role", "unknown")
-                            content = turn.get("content", "")
-                            text += f"<|{role}|>: {content}\n"
-                        elif isinstance(turn, str):
-                            text += turn + "\n"
-                else:
-                    text += str(conversations) + "\n"
-        elif "text" in columns:
-            df = table.select(["text"]).to_pandas()
-            text += "\n".join(df["text"].astype(str).tolist()) + "\n"
-        elif "source" in columns and "answer" in columns:
-            df = table.select(["source", "answer"]).to_pandas()
-            for _, row in df.iterrows():
-                q = str(row.get("source", ""))
-                a = str(row.get("answer", ""))
-                text += f"问题: {q}\n答案: {a}\n"
-
-    except Exception as e:
-        return {"ok": False, "path": file_path, "error": str(e)}
-
-    if text:
         base_name = os.path.basename(file_path)
         output_name = os.path.splitext(base_name)[0] + ".txt"
         output_path = os.path.join(output_dir, output_name)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(text)
-        return {"ok": True, "path": file_path, "chars": len(text)}
+
+        total_chars = 0
+        pieces = []  # 流式缓冲区
+
+        with open(output_path, "w", encoding="utf-8") as f_out:
+
+            if "conversations" in columns:
+                conv_list = table.column("conversations").to_pylist()
+                for conversations in conv_list:
+                    if isinstance(conversations, list):
+                        for turn in conversations:
+                            if isinstance(turn, dict) and "content" in turn:
+                                role = turn.get("role", "unknown")
+                                pieces.append(f"<|{role}|>: {turn['content']}\n")
+                            elif isinstance(turn, str):
+                                pieces.append(turn + "\n")
+                    else:
+                        pieces.append(str(conversations) + "\n")
+                    if len(pieces) >= CHUNK_PIECES:
+                        _flush_pieces(pieces, f_out)
+
+            elif "text" in columns:
+                texts = table.column("text").to_pylist()
+                # 分批写入，避免列表过大
+                for i in range(0, len(texts), CHUNK_PIECES):
+                    chunk = texts[i:i + CHUNK_PIECES]
+                    chunk_text = "".join(
+                        (str(t) + "\n") for t in chunk if t is not None
+                    )
+                    f_out.write(chunk_text)
+                    total_chars += len(chunk_text)
+
+            elif "source" in columns and "answer" in columns:
+                sources = table.column("source").to_pylist()
+                answers = table.column("answer").to_pylist()
+                for q, a in zip(sources, answers):
+                    if q is not None or a is not None:
+                        pieces.append(f"问题: {q}\n答案: {a}\n")
+                    if len(pieces) >= CHUNK_PIECES:
+                        _flush_pieces(pieces, f_out)
+
+            # 最后一批
+            _flush_pieces(pieces, f_out)
+
+        # 统计实际写入量
+        if "text" not in columns:
+            try:
+                total_chars = os.path.getsize(output_path)
+            except OSError:
+                pass
+
+        if total_chars == 0:
+            # 空文件：检查是否真的有内容
+            try:
+                total_chars = os.path.getsize(output_path)
+            except OSError:
+                total_chars = 0
+
+    except Exception as e:
+        return {"ok": False, "path": file_path, "error": str(e)}
+    finally:
+        del table
+        gc.collect()
+
+    if total_chars > 0:
+        return {"ok": True, "path": file_path, "chars": total_chars}
     else:
         return {"ok": False, "path": file_path, "error": "提取到空文本"}
 
@@ -90,7 +141,26 @@ def main():
         print("没有找到 Parquet 文件")
         return
 
-    print(f"找到 {len(file_list)} 个 Parquet 文件，使用 {NUM_WORKERS} 个进程并行处理...")
+    # 中断恢复：跳过已存在的 .txt（支持 Ctrl+C 后重跑）
+    pending = []
+    skipped_count = 0
+    for path in file_list:
+        base_name = os.path.basename(path)
+        output_name = os.path.splitext(base_name)[0] + ".txt"
+        if os.path.isfile(os.path.join(OUTPUT_FOLDER, output_name)):
+            skipped_count += 1
+        else:
+            pending.append(path)
+
+    if skipped_count > 0:
+        print(f"跳过 {skipped_count} 个已存在的 txt 文件")
+
+    if not pending:
+        print("所有文件均已处理完成。")
+        return
+
+    print(f"待处理 {len(pending)} 个 Parquet 文件（共 {len(file_list)}），"
+          f"使用 {NUM_WORKERS} 个进程并行处理...")
     print()
 
     success_count = 0
@@ -100,9 +170,9 @@ def main():
     with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
         futures = {
             executor.submit(process_parquet, path, OUTPUT_FOLDER): path
-            for path in file_list
+            for path in pending
         }
-        with tqdm(total=len(file_list), desc="处理文件", unit="file") as pbar:
+        with tqdm(total=len(pending), desc="处理文件", unit="file") as pbar:
             for future in concurrent.futures.as_completed(futures):
                 try:
                     result = future.result()
