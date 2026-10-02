@@ -4,14 +4,17 @@
 
 import gc
 import os
+import sys
 import glob
 import concurrent.futures
 from tqdm import tqdm
 import pyarrow.parquet as pq
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ========== 配置 ==========
 CORPUS_FOLDER = r"C:\Users\Think\Desktop\input"   # 原始 Parquet 文件夹路径
-OUTPUT_FOLDER = "input"                            # 输出 txt 文件夹（脚本所在目录下）
+OUTPUT_FOLDER = os.path.join(_SCRIPT_DIR, "input") # 输出 txt 文件夹（脚本所在目录下）
 NUM_WORKERS = 4                                    # 并行进程数，建议不超过 CPU 核心数
 # ==========================
 

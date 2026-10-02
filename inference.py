@@ -6,9 +6,14 @@
     python inference.py --prompt "你好" --tokens 300 --temp 0.7
 """
 
+import os
+import sys
 import json
 import argparse
 import torch
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _SCRIPT_DIR)
 
 from model import GPT, get_device
 
@@ -137,9 +142,9 @@ if __name__ == "__main__":
     parser.add_argument("--tokens", type=int, default=200, help="最大生成长度")
     parser.add_argument("--temp", type=float, default=0.8, help="温度 (0=确定)")
     parser.add_argument("--topk", type=int, default=40, help="top-k 采样")
-    parser.add_argument("--model", type=str, default="mini_gpt.pt",
+    parser.add_argument("--model", type=str, default=os.path.join(_SCRIPT_DIR, "mini_gpt.pt"),
                         help="模型文件路径 (默认: mini_gpt.pt)")
-    parser.add_argument("--vocab", type=str, default="vocab.json",
+    parser.add_argument("--vocab", type=str, default=os.path.join(_SCRIPT_DIR, "vocab.json"),
                         help="词汇表文件路径 (默认: vocab.json)")
     args = parser.parse_args()
 

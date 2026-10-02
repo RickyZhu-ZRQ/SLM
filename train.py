@@ -7,6 +7,7 @@ import csv
 import gc
 import math
 import os
+import sys
 import glob
 import json
 import time
@@ -14,6 +15,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+
+# 所有路径基于脚本所在目录，不依赖 CWD
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _SCRIPT_DIR)
 
 from model import GPT, get_device
 
@@ -41,8 +46,8 @@ eval_iters = 200         # 每次评估的 batch 数
 log_interval = 10        # 日志打印间隔
 
 # 数据
-input_folder = "input"   # 预处理生成的 txt 文件夹
-max_chars = 5_000_000    # 最大加载字符数
+input_folder = os.path.join(_SCRIPT_DIR, "input")   # 预处理生成的 txt 文件夹
+max_chars = 5_000    # 最大加载字符数
 
 # ============================================================
 # 设备与混合精度
@@ -97,7 +102,7 @@ decode = lambda l: "".join([itos[i] for i in l])
 print(f"词汇表大小: {vocab_size}")
 
 # 保存 vocab.json（附带超参数，供推理脚本自动读取）
-with open("vocab.json", "w", encoding="utf-8") as f:
+with open(os.path.join(_SCRIPT_DIR, "vocab.json"), "w", encoding="utf-8") as f:
     json.dump({
         "stoi": stoi,
         "itos": {str(k): v for k, v in itos.items()},
@@ -161,7 +166,7 @@ scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
 # 训练状态恢复
 start_iter = 0
-checkpoint_path = "checkpoint.pt"
+checkpoint_path = os.path.join(_SCRIPT_DIR, "checkpoint.pt")
 if os.path.exists(checkpoint_path):
     print(f"发现检查点 {checkpoint_path}，正在恢复...")
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -249,7 +254,7 @@ for iter in range(start_iter, max_iters):
         # 保存最佳模型
         if losses["val"] < best_val_loss:
             best_val_loss = losses["val"]
-            torch.save(model.state_dict(), "mini_gpt_best.pt")
+            torch.save(model.state_dict(), os.path.join(_SCRIPT_DIR, "mini_gpt_best.pt"))
             print(f"  -> 最佳模型已保存 (val_loss={best_val_loss:.4f})")
 
     # --- 训练一步 ---
@@ -297,7 +302,7 @@ total_time = time.time() - start_time
 print(f"\n训练完成，总耗时 {total_time:.2f}s ({total_time/3600:.2f}h)")
 
 # 保存最终模型
-torch.save(model.state_dict(), "mini_gpt.pt")
+torch.save(model.state_dict(), os.path.join(_SCRIPT_DIR, "mini_gpt.pt"))
 torch.save({
     "iter": max_iters - 1,
     "model_state_dict": model.state_dict(),
@@ -348,7 +353,7 @@ ax2.plot(eval_steps, val_ppls, color="tab:red", linestyle="--", alpha=0.4,
 ax2.legend(loc="center right")
 
 fig.tight_layout()
-fig.savefig("loss_curve.png", dpi=300, bbox_inches="tight")
+fig.savefig(os.path.join(_SCRIPT_DIR, "loss_curve.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
 print("损失曲线已保存为 loss_curve.png")
 
@@ -364,13 +369,13 @@ print("\n=== 生成示例 ===")
 print(generated_text)
 
 # 保存训练数据
-with open("loss_history.csv", "w", newline="", encoding="utf-8") as f:
+with open(os.path.join(_SCRIPT_DIR, "loss_history.csv"), "w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)
     w.writerow(["step", "train_loss", "val_loss", "train_perplexity", "val_perplexity"])
     for row in zip(eval_steps, train_losses, val_losses, train_ppls, val_ppls):
         w.writerow(row)
 
-with open("training_log.txt", "w", encoding="utf-8") as f:
+with open(os.path.join(_SCRIPT_DIR, "training_log.txt"), "w", encoding="utf-8") as f:
     f.write(f"设备: {device}\n")
     f.write(f"模型参数量: {total_params:.3f}M\n")
     f.write(f"词汇表大小: {vocab_size}\n")
@@ -386,7 +391,7 @@ with open("training_log.txt", "w", encoding="utf-8") as f:
     f.write("\n====== 生成示例 ======\n")
     f.write(generated_text)
 
-with open("generated_text.txt", "w", encoding="utf-8") as f:
+with open(os.path.join(_SCRIPT_DIR, "generated_text.txt"), "w", encoding="utf-8") as f:
     f.write(generated_text)
 
 print("损失历史 → loss_history.csv")
