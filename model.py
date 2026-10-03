@@ -2,15 +2,33 @@
 共享模型定义：GPT 字符级语言模型
 供 train.py / inference.py 统一导入，修改超参数只需改一处。
 """
+from __future__ import annotations
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# ---- 全局优化开关（训练脚本启动时设置一次即可） ----
+_OPTIMIZED = False
 
+
+def enable_optimizations():
+    """在训练脚本开头调用一次，全局生效。"""
+    global _OPTIMIZED
+    if _OPTIMIZED:
+        return
+    _OPTIMIZED = True
+    # ① 允许 PyTorch 用 TF32 精度做矩阵乘（CPU 上也有效果）
+    torch.set_float32_matmul_precision("high")
+
+    # ② 如果支持 bfloat16 AMP（CPU），后续训练循环可用
+    #    检测写在 train.py 里，这里只提供开关
+
+
+# ---- 优化版因果自注意力（SDPA） ----
 class CausalSelfAttention(nn.Module):
-    """因果自注意力层（带下三角 mask）"""
+    """因果自注意力层 — 使用 PyTorch SDPA 后端自动选择最优核"""
 
     def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float):
         super().__init__()
@@ -18,12 +36,12 @@ class CausalSelfAttention(nn.Module):
         self.n_head = n_head
         self.head_dim = n_embd // n_head
         self.query = nn.Linear(n_embd, n_embd, bias=False)
-        self.key = nn.Linear(n_embd, n_embd, bias=False)
+        self.key   = nn.Linear(n_embd, n_embd, bias=False)
         self.value = nn.Linear(n_embd, n_embd, bias=False)
-        self.proj = nn.Linear(n_embd, n_embd)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-        # 下三角注意力 mask（可广播为 [1, 1, block_size, block_size]）
+        self.proj  = nn.Linear(n_embd, n_embd)
+        self.attn_dropout_p = dropout  # SDPA 不支持 per-forward dropout 参数
+        self.resid_dropout  = nn.Dropout(dropout)
+        # 保留 bias buffer 供旧版兼容（SDPA 路由走 is_causal=True，不读它）
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size),
@@ -31,20 +49,26 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()
+        # Q/K/V: (B, T, C) → (B, n_head, T, head_dim)
         q = self.query(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = self.key(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = self.value(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v
+
+        # SDPA：PyTorch 自动选择最优后端（CPU 上用 math/aten 内核，GPU 上用 FlashAttention）
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+            is_causal=True,
+        )
+        # y: (B, n_head, T, head_dim) → (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.proj(y)
         y = self.resid_dropout(y)
         return y
 
 
+# ---- MLP（不变） ----
 class MLP(nn.Module):
     """两层全连接前馈网络（GELU 激活）"""
 
@@ -62,15 +86,16 @@ class MLP(nn.Module):
         return x
 
 
+# ---- Transformer Block（不变） ----
 class TransformerBlock(nn.Module):
     """Pre-LN Transformer Block"""
 
     def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float):
         super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln1  = nn.LayerNorm(n_embd)
         self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout)
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.mlp = MLP(n_embd, dropout)
+        self.ln2  = nn.LayerNorm(n_embd)
+        self.mlp  = MLP(n_embd, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln1(x))
@@ -78,6 +103,7 @@ class TransformerBlock(nn.Module):
         return x
 
 
+# ---- GPT（微调：前向允许指定内存格式） ----
 class GPT(nn.Module):
     """字符级 GPT 语言模型"""
 
@@ -92,13 +118,13 @@ class GPT(nn.Module):
     ):
         super().__init__()
         self.block_size = block_size
-        self.token_embedding = nn.Embedding(vocab_size, n_embd)
+        self.token_embedding    = nn.Embedding(vocab_size, n_embd)
         self.position_embedding = nn.Embedding(block_size, n_embd)
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.Sequential(
             *[TransformerBlock(n_embd, n_head, block_size, dropout) for _ in range(n_layer)]
         )
-        self.ln_f = nn.LayerNorm(n_embd)
+        self.ln_f    = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
         # weight tying: embedding 与 lm_head 共享权重
         self.token_embedding.weight = self.lm_head.weight
@@ -125,10 +151,11 @@ class GPT(nn.Module):
 
         loss = None
         if targets is not None:
-            B, T, V = logits.size()
-            logits = logits.view(B * T, V)
-            targets = targets.view(B * T)
-            loss = F.cross_entropy(logits, targets)
+            # fused cross-entropy: view inside C is more efficient
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+            )
         return logits, loss
 
     @torch.no_grad()
@@ -143,7 +170,7 @@ class GPT(nn.Module):
         was_training = self.training
         self.eval()
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size :]
+            idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:

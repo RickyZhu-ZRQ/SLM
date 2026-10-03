@@ -4,8 +4,10 @@
 
 import gc
 import os
+import re
 import sys
 import glob
+import unicodedata
 import concurrent.futures
 from tqdm import tqdm
 import pyarrow.parquet as pq
@@ -17,6 +19,33 @@ CORPUS_FOLDER = r"C:\Users\Think\Desktop\input"   # 原始 Parquet 文件夹路�
 OUTPUT_FOLDER = os.path.join(_SCRIPT_DIR, "input") # 输出 txt 文件夹（脚本所在目录下）
 NUM_WORKERS = 4                                    # 并行进程数，建议不超过 CPU 核心数
 # ==========================
+
+# ========== 文本清洗 ==========
+_RE_CONTROL = re.compile(
+    "[" "\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f" "]", flags=re.UNICODE
+)
+
+def clean_text(text: str) -> str:
+    """移除不可渲染/干扰字符，保留正常 Unicode 文本"""
+    text = _RE_CONTROL.sub("", text)
+    lines = []
+    for line in text.split("\n"):
+        cleaned = []
+        for ch in line:
+            cp = ord(ch)
+            # 私有区 (PUA)
+            if (0xE000 <= cp <= 0xF8FF) or (0xF0000 <= cp <= 0x10FFFD):
+                continue
+            # 非字符 (noncharacters)
+            if (cp & 0xFFFE) == 0xFFFE and (0xFDD0 <= cp <= 0xFDEF or cp >= 0xFFFE):
+                continue
+            # 格式字符（BOM、零宽等）
+            if unicodedata.category(ch) == "Cf" or unicodedata.category(ch) == "Cn":
+                continue
+            cleaned.append(ch)
+        lines.append("".join(cleaned))
+    return "\n".join(lines)
+# ============================
 
 # 错误计数器（进程间共享需用 multiprocessing.Value，这里走简化方案：返回状态）
 SKIPPED_FILES = []
@@ -30,10 +59,11 @@ CHUNK_BYTES = 4 * 1024 * 1024  # 4MB
 
 
 def _flush_pieces(pieces: list, f_out) -> None:
-    """将 pieces 列表 join 写入文件并清空"""
+    """将 pieces 列表 join、清洗、写入文件并清空"""
     if not pieces:
         return
     text = "".join(pieces)
+    text = clean_text(text)
     f_out.write(text)
     pieces.clear()
 

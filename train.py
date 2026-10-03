@@ -7,10 +7,12 @@ import csv
 import gc
 import math
 import os
+import re
 import sys
 import glob
 import json
 import time
+import unicodedata
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,13 +22,55 @@ import matplotlib.pyplot as plt
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 
-from model import GPT, get_device
+from model import GPT, get_device, enable_optimizations
+
+# ============================================================
+# 全局优化开关
+# ============================================================
+enable_optimizations()
+
+# CPU 线程配置：interop=1 对单 GPU/CPU 训练显著更快（避免线程竞争）
+torch.set_num_threads(os.cpu_count())
+torch.set_num_interop_threads(1)
+
+# ============================================================
+# 文本清洗：移除噪声字符
+# ============================================================
+# 控制字符（保留 tab / LF / CR 用于文本结构）
+_RE_CONTROL = re.compile(
+    "[" "\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f" "]", flags=re.UNICODE
+)
+
+def clean_text(text: str) -> str:
+    """移除不可渲染/干扰字符，保留正常 Unicode 文本"""
+    # 1. C0/C1 控制字符（除 tab/LF/CR）
+    text = _RE_CONTROL.sub("", text)
+    # 2. 按行处理：过滤行内不可见字符
+    lines = []
+    for line in text.split("\n"):
+        cleaned_chars = []
+        for ch in line:
+            cp = ord(ch)
+            # 跳过私用区 (PUA: BMP + 平面15 + 平面16)
+            if (0xE000 <= cp <= 0xF8FF) or (0xF0000 <= cp <= 0x10FFFD):
+                continue
+            # 跳过非字符 (noncharacters)
+            if (cp & 0xFFFE) == 0xFFFE and (0xFDD0 <= cp <= 0xFDEF or cp >= 0xFFFE):
+                continue
+            # 跳过零宽/格式字符 + 未分配码点
+            cat = unicodedata.category(ch)
+            if cat in ("Cf", "Cn"):  # Format chars, Unassigned
+                continue
+            cleaned_chars.append(ch)
+        lines.append("".join(cleaned_chars))
+    return "\n".join(lines)
 
 # ============================================================
 # 超参数
 # ============================================================
 block_size = 256         # 上下文长度
-batch_size = 16          # 批次大小
+batch_size = 8           # 微批次大小（单次前向的 batch）
+grad_accum_steps = 2      # 梯度累积步数 → 有效 batch = 8×2 = 16
 n_layer = 6              # Transformer 层数
 n_head = 8               # 注意力头数
 n_embd = 256             # 嵌入维度
@@ -39,15 +83,16 @@ weight_decay = 0.01      # AdamW 权重衰减
 grad_clip = 1.0          # 梯度裁剪阈值
 
 # 训练控制
-max_iters = 50000        # 总训练步数
+max_iters = 50000       # 总训练步数
 warmup_iters = 1000      # 学习率预热步数
-eval_interval = 500      # 评估间隔
+eval_interval = 999999   # 不评估（设得比 max_iters 大即永远不触发）
 eval_iters = 200         # 每次评估的 batch 数
-log_interval = 10        # 日志打印间隔
+log_interval = 50        # 进度汇报间隔（仅步数）
+detail_interval = 1000   # 详细日志间隔（loss/lr/耗时）
 
 # 数据
 input_folder = os.path.join(_SCRIPT_DIR, "input")   # 预处理生成的 txt 文件夹
-max_chars = 5_000    # 最大加载字符数
+max_chars = 1_000_000_000   # 最大加载字符数
 
 # ============================================================
 # 设备与混合精度
@@ -58,8 +103,6 @@ device = get_device()
 use_amp = (device == "cuda")
 if device == "cuda":
     torch.backends.cudnn.benchmark = True
-elif device == "cpu":
-    torch.set_num_threads(os.cpu_count())
 
 print(f"设备: {device}, 混合精度: {use_amp}")
 
@@ -90,6 +133,13 @@ def load_text(folder: str, max_chars: int) -> str:
 
 
 text = load_text(input_folder, max_chars)
+
+# 清洗噪声字符（控制字符、零宽字符、私用区码点等）
+before = len(text)
+text = clean_text(text)
+removed = before - len(text)
+if removed > 0:
+    print(f"清洗噪声字符: {removed:,} 个 ({100*removed/before:.2f}%) 被移除")
 
 # 字符映射
 chars = sorted(list(set(text)))
@@ -125,6 +175,15 @@ val_data = data[n_train:]
 del text  # 释放 5M+ 字符串内存
 gc.collect()
 
+# 数据量校验
+min_required = block_size + batch_size * 2
+if len(train_data) <= block_size or len(val_data) <= block_size:
+    raise RuntimeError(
+        f"数据量不足: train={len(train_data)}, val={len(val_data)}, "
+        f"block_size={block_size}。需要至少 {block_size + 1} 个 token。"
+        f"\n  当前 max_chars={max_chars}，建议增大该值或增加语料。"
+    )
+
 
 def get_batch(split: str):
     """随机采样一个 batch"""
@@ -147,13 +206,9 @@ model = GPT(
     dropout=dropout,
 ).to(device)
 
-# torch.compile (PyTorch >= 2.0)
-if hasattr(torch, "compile"):
-    try:
-        model = torch.compile(model)
-        print("已启用 torch.compile")
-    except Exception as e:
-        print(f"torch.compile 不可用: {e}")
+# torch.compile: 需要 C++ 编译器，当前环境不可用 → 跳过
+# 改用 set_float32_matmul_precision("high") + SDPA (已在 enable_optimizations() 中设置)
+print("优化: SDPA + fp32_matmul_precision=high")
 
 # 优化器
 optimizer = torch.optim.AdamW(
@@ -190,11 +245,13 @@ def get_lr(iter: int) -> float:
 # 训练
 # ============================================================
 total_params = sum(p.numel() for p in model.parameters()) / 1e6
+effective_batch = batch_size * grad_accum_steps
 print(f"\n{'='*50}")
 print(f"模型参数量: {total_params:.3f}M")
 print(f"词汇表大小: {vocab_size}")
 print(f"训练步数: {start_iter} → {max_iters}")
-print(f"batch_size={batch_size}, block_size={block_size}")
+print(f"微批次={batch_size} × 累积={grad_accum_steps} → 有效批次={effective_batch}")
+print(f"block_size={block_size}")
 print(f"n_layer={n_layer}, n_head={n_head}, n_embd={n_embd}")
 print(f"lr={learning_rate}, min_lr={min_lr}, warmup={warmup_iters}")
 print(f"{'='*50}\n")
@@ -230,8 +287,8 @@ for iter in range(start_iter, max_iters):
     for param_group in optimizer.param_groups:
         param_group["lr"] = current_lr
 
-    # --- 评估 ---
-    if iter % eval_interval == 0 or iter == max_iters - 1:
+    # --- 评估（已禁用）---
+    if False:
         losses = estimate_loss()
         # CUDA: 评估完后清一波碎片
         if device == "cuda":
@@ -257,41 +314,67 @@ for iter in range(start_iter, max_iters):
             torch.save(model.state_dict(), os.path.join(_SCRIPT_DIR, "mini_gpt_best.pt"))
             print(f"  -> 最佳模型已保存 (val_loss={best_val_loss:.4f})")
 
-    # --- 训练一步 ---
-    xb, yb = get_batch("train")
+    # --- 训练一步（梯度累积） ---
     optimizer.zero_grad(set_to_none=True)
+    accum_loss = 0.0
+
+    for micro_step in range(grad_accum_steps):
+        xb, yb = get_batch("train")
+
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                _, loss = model(xb, yb)
+            # 用 loss/grad_accum_steps 累加梯度（总 loss 不变但梯度正确）
+            scaler.scale(loss / grad_accum_steps).backward()
+        else:
+            _, loss = model(xb, yb)
+            (loss / grad_accum_steps).backward()
+        accum_loss += loss.item()
 
     if scaler is not None:
-        with torch.cuda.amp.autocast():
-            _, loss = model(xb, yb)
-        scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         scaler.step(optimizer)
         scaler.update()
     else:
-        _, loss = model(xb, yb)
-        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-    # --- 日志 ---
-    if iter % log_interval == 0 or iter == max_iters - 1:
+    avg_loss = accum_loss / grad_accum_steps
+
+    # --- 进度条（同行动态更新） ---
+    if iter % log_interval == 0:
+        pct = iter / max_iters
+        bar_len = 30
+        filled = int(bar_len * pct)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        elapsed = time.time() - start_time
+        eta = elapsed / pct * (1 - pct) if pct > 0 else 0
+        print(
+            f"\r[训练] {bar} {iter}/{max_iters} ({pct*100:.1f}%) | "
+            f"用时 {elapsed:.0f}s | 剩余 {eta:.0f}s",
+            end="", flush=True,
+        )
+
+    # --- 详细日志 ---
+    if iter % detail_interval == 0 or iter == max_iters - 1:
+        print()  # 进度条换行
         step_time = time.time() - iter_start
-        loss_val = loss.item()
+        loss_val = avg_loss
+        eff_tok_s = effective_batch * block_size / step_time
         mem_info = ""
         if device == "cuda":
             alloc = torch.cuda.memory_allocated() / 1024**2
             reserved = torch.cuda.memory_reserved() / 1024**2
             mem_info = f" | 显存 {alloc:.1f}MB (预留 {reserved:.1f}MB)"
         print(
-            f"[训练] step {iter:6d}/{max_iters} | "
+            f"[详细] step {iter:6d}/{max_iters} | "
             f"loss {loss_val:.4f} | lr {current_lr:.6f} | "
-            f"耗时 {step_time:.3f}s{mem_info}"
+            f"耗时 {step_time:.3f}s | {eff_tok_s:.0f} tok/s{mem_info}"
         )
 
     # --- 定时保存检查点 ---
-    if iter % 2000 == 0 and iter > 0:
+    if iter % 500 == 0 and iter > 0:
         torch.save({
             "iter": iter,
             "model_state_dict": model.state_dict(),
